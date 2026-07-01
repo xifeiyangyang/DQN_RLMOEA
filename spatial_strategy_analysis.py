@@ -81,7 +81,7 @@ def load_data():
 
     county_gdf = gpd.read_file(os.path.join(BASE_DIR, "shanghai_data_processer", "上海市_县界.shp"))
 
-    scheme_df = pd.read_excel(os.path.join(BASE_DIR, "RL-MOEA2_4个方案详情_中文版.xlsx"),
+    scheme_df = pd.read_excel(os.path.join(BASE_DIR, "RL-MOEA2_4_Schemes_Detail.xlsx"),
                               engine='openpyxl')
     scheme_indices = [[int(x) for x in str(row.iloc[4]).split(',')]
                       for _, row in scheme_df.iterrows()]
