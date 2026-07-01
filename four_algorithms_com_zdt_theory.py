@@ -25,8 +25,8 @@ MORANDI_COLORS = {
     "NSGA2": "#5B8C9A",      # teal blue
     "MOEAD": "#C97B63",      # terracotta
     "SPEA3": "#8FAA6D",      # olive green
-    "RL-MOEA1": "#9B7BB8",   # soft purple
-    "RL-MOEA2": "#4A6FA5",   # clear blue (proposed method)
+    "RL-MOEA": "#9B7BB8",       # soft purple (ablation baseline)
+    "DQN-RLMOEA": "#4A6FA5",    # clear blue (proposed method)
 }
 MORANDI_TRUE_PF = "#2F2F2F"
 MORANDI_GRID = "#D0D0D0"
@@ -35,8 +35,8 @@ MORANDI_MARKERS = {
     "NSGA2": "s",
     "MOEAD": "^",
     "SPEA3": "x",
-    "RL-MOEA1": "o",
-    "RL-MOEA2": "*",
+    "RL-MOEA": "o",
+    "DQN-RLMOEA": "*",
 }
 
 # ZDT figure typography (larger canvas + spacing to avoid crowding)
@@ -817,29 +817,47 @@ class DQN_ZDT(nn.Module):
         return self.fc3(x)
 
 class RLMOEA2_ZDT:
+    """DQN-RLMOEA adapted for ZDT continuous problems — full DQN with target network + experience replay + HV reward."""
     def __init__(self, problem, pop_size=50, max_iter=200):
         self.problem = problem
         self.pop_size = pop_size
         self.max_iter = max_iter
-        self.mutation_prob = 0.1
-        
-        # DQN配置
+        self.mutation_prob = 0.05  # tuned from sensitivity analysis
+
+        # DQN configuration (full: target network + experience replay)
         self.state_dim = 4
         self.action_dim = 3
         self.dqn = DQN_ZDT(self.state_dim, self.action_dim)
-        self.optimizer = optim.Adam(self.dqn.parameters(), lr=0.001)
-        self.epsilon = 0.9
+        self.target_dqn = DQN_ZDT(self.state_dim, self.action_dim)
+        self.target_dqn.load_state_dict(self.dqn.state_dict())
+        self.optimizer = optim.Adam(self.dqn.parameters(), lr=0.0005)
+        self.criterion = nn.MSELoss()
+        self.epsilon = 0.85
         self.epsilon_decay = 0.995
         self.epsilon_min = 0.1
-        
-        # 种群初始化
+
+        # Experience replay
+        self.replay_buffer = []
+        self.max_replay_size = 500
+        self.batch_size = 16
+        self.gamma = 0.80
+        self.target_update_freq = 10
+        self.update_counter = 0
+        self.state_before_action = None
+
+        # Hypervolume reference point
+        total_f1 = 100.0  # rough upper bound for ZDT objectives
+        total_f2 = 100.0
+        self.hv_ref_point = np.array([total_f1, total_f2])
+
+        # Population initialization
         self.pop = self._init_population()
         self.fitness = np.array([self.problem.evaluate(ind) for ind in self.pop])
         self.current_iter = 0
         self.last_action = 0
         self.last_reward = 0.0
-        
-        # 归一化参考值
+
+        # Normalization references
         self.max_fitness = np.max(self.fitness, axis=0) if len(self.fitness) > 0 else np.array([1.0, 1.0])
         self.min_fitness = np.min(self.fitness, axis=0) if len(self.fitness) > 0 else np.array([0.0, 0.0])
     
@@ -871,12 +889,32 @@ class RLMOEA2_ZDT:
         
         return torch.tensor([avg_fitness[0], avg_fitness[1], diversity_norm, iter_progress], dtype=torch.float32)
     
+    def _compute_hypervolume(self, pareto_fitness):
+        """Compute 2-objective hypervolume (same as Shanghai experiment)."""
+        if len(pareto_fitness) == 0:
+            return 0.0
+        mask = (pareto_fitness[:, 0] <= self.hv_ref_point[0]) & \
+               (pareto_fitness[:, 1] <= self.hv_ref_point[1])
+        points = pareto_fitness[mask]
+        if len(points) == 0:
+            return 0.0
+        sorted_idx = np.argsort(points[:, 0])
+        sorted_points = points[sorted_idx]
+        hv = 0.0
+        best_f2 = self.hv_ref_point[1]
+        for p in sorted_points:
+            if p[1] < best_f2:
+                hv += (self.hv_ref_point[0] - p[0]) * (best_f2 - p[1])
+                best_f2 = p[1]
+        return hv
+
     def _select_operator(self):
-        """ε-贪心选择交叉算子"""
+        """epsilon-greedy action selection with state recording."""
+        state = self._get_state()
+        self.state_before_action = state
         if random.random() < self.epsilon:
             action = random.choice(range(self.action_dim))
         else:
-            state = self._get_state()
             q_values = self.dqn(state)
             action = torch.argmax(q_values).item()
         self.last_action = action
@@ -960,22 +998,37 @@ class RLMOEA2_ZDT:
                 mutated[i] = np.clip(mutated[i], low, high)
         return mutated
     
-    def _update_dqn(self, reward):
-        """更新DQN网络"""
-        if self.current_iter == 0:
+    def _update_dqn(self):
+        """Update DQN via experience replay + target network (same as Shanghai experiment)."""
+        if len(self.replay_buffer) < self.batch_size:
             return
-        
-        state = self._get_state()
-        target = reward + 0.9 * torch.max(self.dqn(state))
-        q_value = self.dqn(state)[self.last_action]
-        loss = nn.MSELoss()(q_value, target.detach())
+
+        batch = random.sample(self.replay_buffer, self.batch_size)
+        states, actions, rewards, next_states = zip(*batch)
+        states = torch.stack(states)
+        next_states = torch.stack(next_states)
+        rewards = torch.tensor(rewards, dtype=torch.float32)
+        actions = torch.tensor(actions, dtype=torch.long)
+
+        q_values = self.dqn(states)
+        q_value = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
+
+        with torch.no_grad():
+            next_q_values = self.target_dqn(next_states)
+            max_next_q = next_q_values.max(1)[0]
+            target = rewards + self.gamma * max_next_q
+
+        loss = self.criterion(q_value, target)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        
-        # 衰减探索率
+
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
+
+        self.update_counter += 1
+        if self.update_counter % self.target_update_freq == 0:
+            self.target_dqn.load_state_dict(self.dqn.state_dict())
     
     def run(self):
         """运行RL-MOEA2算法"""
@@ -1033,16 +1086,19 @@ class RLMOEA2_ZDT:
                                                fitness_front[sorted_idx[i - 1], obj]) / (obj_max - obj_min)
             return distance
         
-        old_pareto_size = 0
-        
         for iter in range(self.max_iter):
             self.current_iter = iter
             if len(self.fitness) == 0:
                 break
-            
+
             # 更新参考值
             self.max_fitness = np.maximum(self.max_fitness, np.max(self.fitness, axis=0))
             self.min_fitness = np.minimum(self.min_fitness, np.min(self.fitness, axis=0))
+
+            # Compute HV before action
+            old_fronts = _fast_nondominated_sort(self.fitness)
+            old_hv = self._compute_hypervolume(self.fitness[old_fronts[0]]) \
+                if (len(old_fronts) > 0 and len(old_fronts[0]) > 0) else 0.0
             
             # 选择交叉算子
             action = self._select_operator()
@@ -1119,14 +1175,20 @@ class RLMOEA2_ZDT:
             self.pop = np.array(new_pop[:self.pop_size])
             self.fitness = np.array(new_fitness[:self.pop_size])
             
-            # 计算奖励
-            current_fronts = _fast_nondominated_sort(self.fitness)
-            current_pareto_size = len(current_fronts[0]) if len(current_fronts) > 0 else 0
-            reward = (current_pareto_size - old_pareto_size) * 0.1
-            old_pareto_size = current_pareto_size
-            
-            # 更新DQN
-            self._update_dqn(reward)
+            # HV-based reward (same as Shanghai experiment)
+            new_fronts = _fast_nondominated_sort(self.fitness)
+            new_hv = self._compute_hypervolume(self.fitness[new_fronts[0]]) \
+                if (len(new_fronts) > 0 and len(new_fronts[0]) > 0) else 0.0
+            reward = (new_hv - old_hv) / (old_hv + 1e-6)
+
+            # Store experience + update DQN (experience replay + target network)
+            state_after = self._get_state()
+            if self.state_before_action is not None:
+                self.replay_buffer.append(
+                    (self.state_before_action, self.last_action, reward, state_after))
+                if len(self.replay_buffer) > self.max_replay_size:
+                    self.replay_buffer.pop(0)
+            self._update_dqn()
         
         # 提取Pareto前沿
         if len(self.fitness) == 0:
@@ -1344,8 +1406,8 @@ def run_zdt_algorithm_comparison(zdt_name="ZDT1", n_vars=30, pop_size=50, max_it
         "NSGA2": StandardNSGA2_ZDT(problem, pop_size=pop_size, max_iter=max_iter),
         "MOEAD": StandardMOEAD_ZDT(problem, pop_size=pop_size, max_iter=max_iter),
         "SPEA3": StandardSPEA3_ZDT(problem, pop_size=pop_size, max_iter=max_iter),
-        "RL-MOEA1": RLMOEA1_ZDT(problem, pop_size=pop_size, max_iter=max_iter),
-        "RL-MOEA2": RLMOEA2_ZDT(problem, pop_size=pop_size, max_iter=max_iter)
+        "RL-MOEA": RLMOEA1_ZDT(problem, pop_size=pop_size, max_iter=max_iter),
+        "DQN-RLMOEA": RLMOEA2_ZDT(problem, pop_size=pop_size, max_iter=max_iter)
     }
 
     # 4. 运行所有算法
@@ -1477,13 +1539,13 @@ def run_zdt_algorithm_comparison(zdt_name="ZDT1", n_vars=30, pop_size=50, max_it
     ax4.grid(True, alpha=0.45, axis="y", linestyle="--", color=MORANDI_GRID)
 
     fig.tight_layout(rect=[0, 0.02, 1, 0.990], pad=1.0, h_pad=1.0, w_pad=2.0)
-    save_img_name = f"{zdt_name}_comparison_results_中文版.png"
-    plt.savefig(save_img_name, dpi=300, bbox_inches="tight", pad_inches=0.12)
-    plt.show()
-    print(f"\n对比图片已保存：{save_img_name}")
+    save_img_name = f"{zdt_name}_comparison_results.png"
+    plt.savefig(save_img_name, dpi=600, bbox_inches="tight", pad_inches=0.12)
+    plt.close()
+    print(f"\nFigure saved: {save_img_name}")
 
-    # 8. 保存指标表格
-    save_csv_name = f"{zdt_name}_算法性能指标_中文版.csv"
+    # 8. Save metrics table
+    save_csv_name = f"{zdt_name}_algorithm_metrics.csv"
     metrics_df.to_csv(save_csv_name, encoding="utf-8-sig")
     print(f"指标表格已保存：{save_csv_name}")
 
@@ -1491,16 +1553,17 @@ def run_zdt_algorithm_comparison(zdt_name="ZDT1", n_vars=30, pop_size=50, max_it
 
 # ====================== 6. 主函数 ======================
 if __name__ == "__main__":
-    # Change zdt_name to run a specific benchmark: ZDT1 / ZDT2 / ZDT3 / ZDT4 / ZDT6
-    zdt_name = "ZDT4"  # e.g. set to "ZDT2" for ZDT2 experiments
-    n_vars = 30  # ZDT问题默认30维
+    n_vars = 30
     pop_size = 50
     max_iter = 500
 
-    # 运行对比
-    metrics_df, results = run_zdt_algorithm_comparison(
-        zdt_name=zdt_name,
-        n_vars=n_vars,
-        pop_size=pop_size,
-        max_iter=max_iter
-    )
+    for zdt_name in ["ZDT1", "ZDT2", "ZDT3", "ZDT4", "ZDT6"]:
+        print("\n" + "=" * 70)
+        print("Running %s" % zdt_name)
+        print("=" * 70)
+        metrics_df, results = run_zdt_algorithm_comparison(
+            zdt_name=zdt_name,
+            n_vars=n_vars,
+            pop_size=pop_size,
+            max_iter=max_iter
+        )
